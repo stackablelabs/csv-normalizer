@@ -1,3 +1,7 @@
 resources:
   foo:
     backend: http://localhost:9997/test.csv
+    transforms:
+    - RenameColumn:
+        from: a
+        to: e

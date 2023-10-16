@@ -19,8 +19,11 @@ struct Args {
 
 #[derive(Snafu, Debug)]
 enum RunError {
+    #[snafu(display("unable to read config file"))]
     ReadConfig { source: std::io::Error },
+    #[snafu(display("unable to parse config file"))]
     ParseConfig { source: serde_yaml::Error },
+    #[snafu(display("unable to start HTTP server"))]
     StartServer { source: hyper::Error },
 }
 
@@ -30,14 +33,17 @@ pub struct AppState {
     http: reqwest::Client,
 }
 
+#[snafu::report]
 #[tokio::main]
 async fn main() -> Result<(), RunError> {
     let args = Args::parse();
     let config = Arc::<Config>::new(
-        serde_yaml::from_slice(
-            &tokio::fs::read(args.config)
-                .await
-                .context(ReadConfigSnafu)?,
+        serde_yaml::with::singleton_map_recursive::deserialize(
+            serde_yaml::Deserializer::from_slice(
+                &tokio::fs::read(args.config)
+                    .await
+                    .context(ReadConfigSnafu)?,
+            ),
         )
         .context(ParseConfigSnafu)?,
     );

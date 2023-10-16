@@ -1,4 +1,6 @@
-use crate::http_error;
+use std::borrow::Cow;
+
+use crate::{config::Transform, http_error};
 
 use super::AppState;
 
@@ -7,10 +9,13 @@ use axum::{
     http::HeaderValue,
     response::IntoResponse,
 };
-use hyper::{header::CONTENT_TYPE, StatusCode};
+use csv::ByteRecord;
+use hyper::{
+    header::{CONTENT_LENGTH, CONTENT_TYPE},
+    StatusCode,
+};
 use snafu::{OptionExt, ResultExt, Snafu};
 
-static CONTENT_TYPE_BINARY: HeaderValue = HeaderValue::from_static("application/octet-stream");
 static CONTENT_TYPE_CSV: HeaderValue = HeaderValue::from_static("text/csv");
 
 #[derive(Snafu, Debug)]
@@ -19,12 +24,15 @@ pub enum Error {
     NoResource { resource: String },
     #[snafu(display("failed to forward request to backend"))]
     BackendRequest { source: reqwest::Error },
+    #[snafu(display("failed to retrieve requewst from backend"))]
+    ReadResponse { source: reqwest::Error },
 }
 impl http_error::Error for Error {
     fn status_code(&self) -> hyper::StatusCode {
         match self {
             Error::NoResource { .. } => StatusCode::NOT_FOUND,
             Error::BackendRequest { .. } => StatusCode::BAD_GATEWAY,
+            Error::ReadResponse { .. } => StatusCode::BAD_GATEWAY,
         }
     }
 }
@@ -44,20 +52,81 @@ pub async fn get_resource(
         .send()
         .await
         .context(BackendRequestSnafu)?;
+    let status = backend_response.status();
     let mut headers = backend_response.headers().clone();
-    match headers.entry(CONTENT_TYPE) {
-        hyper::header::Entry::Occupied(mut entry) if entry.get() == CONTENT_TYPE_BINARY => {
-            entry.insert(CONTENT_TYPE_CSV.clone());
+
+    let in_bytes = backend_response.bytes().await.context(ReadResponseSnafu)?;
+    // pass error responses through unchanged
+    let output_bytes = if status.is_success() {
+        headers.insert(CONTENT_TYPE, CONTENT_TYPE_CSV.clone());
+        headers.remove(CONTENT_LENGTH);
+
+        let mut transformers = resource_config
+            .transforms
+            .iter()
+            .map(Transformer::from_transform)
+            .collect::<Vec<_>>();
+
+        let mut csv_r = csv::ReaderBuilder::new()
+            .has_headers(false) // Each transformer manages its own headers
+            .from_reader(in_bytes.as_ref());
+        let mut csv_output_bytes = Vec::<u8>::new();
+        let mut csv_w = csv::Writer::from_writer(&mut csv_output_bytes);
+        let mut in_record = ByteRecord::new();
+        while csv_r.read_byte_record(&mut in_record).unwrap() {
+            let mut fields = in_record.iter().map(Cow::Borrowed).collect();
+            for transformer in &mut transformers {
+                transformer.process_record(&mut fields);
+            }
+            csv_w.write_record(&fields).unwrap();
         }
-        hyper::header::Entry::Vacant(entry) => {
-            entry.insert(CONTENT_TYPE_CSV.clone());
+        csv_w.flush().unwrap();
+        drop(csv_w);
+        csv_output_bytes.into_response()
+    } else {
+        in_bytes.into_response()
+    };
+
+    Ok((status, headers, output_bytes).into_response())
+}
+
+pub enum Transformer<'a> {
+    RenameColumn {
+        is_header_row: bool,
+        from: &'a str,
+        to: &'a str,
+    },
+}
+impl<'a> Transformer<'a> {
+    fn from_transform(transform: &'a Transform) -> Self {
+        match transform {
+            Transform::RenameColumn { from, to } => Self::RenameColumn {
+                is_header_row: true,
+                from,
+                to,
+            },
         }
-        _ => {}
     }
-    Ok((
-        backend_response.status(),
-        headers,
-        backend_response.bytes().await.unwrap(),
-    )
-        .into_response())
+
+    fn process_record<'b>(&mut self, record: &mut Vec<Cow<'b, [u8]>>)
+    where
+        'a: 'b,
+    {
+        match self {
+            Self::RenameColumn {
+                is_header_row,
+                from,
+                to,
+            } => {
+                if *is_header_row {
+                    for col in record {
+                        if *col == from.as_bytes() {
+                            *col = Cow::Borrowed(to.as_bytes());
+                        }
+                    }
+                    *is_header_row = false;
+                }
+            }
+        }
+    }
 }

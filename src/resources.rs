@@ -26,6 +26,12 @@ pub enum Error {
     BackendRequest { source: reqwest::Error },
     #[snafu(display("failed to retrieve requewst from backend"))]
     ReadResponse { source: reqwest::Error },
+    #[snafu(display("failed to parse record"))]
+    ParseRecord { source: csv::Error },
+    #[snafu(display("failed to write record"))]
+    WriteRecord { source: csv::Error },
+    #[snafu(display("failed to flush records"))]
+    FlushRecords { source: std::io::Error },
 }
 impl http_error::Error for Error {
     fn status_code(&self) -> hyper::StatusCode {
@@ -33,6 +39,7 @@ impl http_error::Error for Error {
             Error::NoResource { .. } => StatusCode::NOT_FOUND,
             Error::BackendRequest { .. } => StatusCode::BAD_GATEWAY,
             Error::ReadResponse { .. } => StatusCode::BAD_GATEWAY,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -69,18 +76,22 @@ pub async fn get_resource(
 
         let mut csv_r = csv::ReaderBuilder::new()
             .has_headers(false) // Each transformer manages its own headers
+            .delimiter(resource_config.parser.field_separator as u8)
             .from_reader(in_bytes.as_ref());
         let mut csv_output_bytes = Vec::<u8>::new();
         let mut csv_w = csv::Writer::from_writer(&mut csv_output_bytes);
         let mut in_record = ByteRecord::new();
-        while csv_r.read_byte_record(&mut in_record).unwrap() {
+        while csv_r
+            .read_byte_record(&mut in_record)
+            .context(ParseRecordSnafu)?
+        {
             let mut fields = in_record.iter().map(Cow::Borrowed).collect();
             for transformer in &mut transformers {
                 transformer.process_record(&mut fields);
             }
-            csv_w.write_record(&fields).unwrap();
+            csv_w.write_record(&fields).context(WriteRecordSnafu)?;
         }
-        csv_w.flush().unwrap();
+        csv_w.flush().context(FlushRecordsSnafu)?;
         drop(csv_w);
         csv_output_bytes.into_response()
     } else {

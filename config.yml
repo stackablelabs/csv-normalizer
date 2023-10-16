@@ -5,3 +5,7 @@ resources:
     - RenameColumn:
         from: a
         to: e
+  bar:
+    backend: https://fritz.freiburg.de/duva2dcat/dataset/de-bw-freiburg-wahlergebnisse_bundestags_landtags-_und_europawahl_stadtbezirke_zeitreihe/content.csv
+    parser:
+      fieldDelimiter: ";"

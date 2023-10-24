@@ -1,11 +1,11 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, char::TryFromCharError};
 
 use crate::{config::Transform, http_error};
 
 use super::AppState;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::HeaderValue,
     response::IntoResponse,
 };
@@ -14,6 +14,7 @@ use hyper::{
     header::{CONTENT_LENGTH, CONTENT_TYPE},
     StatusCode,
 };
+use serde::Deserialize;
 use snafu::{OptionExt, ResultExt, Snafu};
 
 static CONTENT_TYPE_CSV: HeaderValue = HeaderValue::from_static("text/csv");
@@ -26,6 +27,8 @@ pub enum Error {
     BackendRequest { source: reqwest::Error },
     #[snafu(display("failed to retrieve requewst from backend"))]
     ReadResponse { source: reqwest::Error },
+    #[snafu(display("invalid output delimiter requested"))]
+    InvalidOutputDelimiter { source: TryFromCharError },
     #[snafu(display("failed to parse record"))]
     ParseRecord { source: csv::Error },
     #[snafu(display("failed to write record"))]
@@ -44,9 +47,22 @@ impl http_error::Error for Error {
     }
 }
 
+#[derive(Deserialize)]
+pub struct Opts {
+    #[serde(default = "Opts::default_delimiter")]
+    delimiter: char,
+}
+
+impl Opts {
+    fn default_delimiter() -> char {
+        ','
+    }
+}
+
 pub async fn get_resource(
     State(state): State<AppState>,
     Path(resource): Path<String>,
+    Query(opts): Query<Opts>,
 ) -> Result<axum::response::Response, http_error::JsonResponse<Error>> {
     let resource_config = state
         .config
@@ -79,7 +95,13 @@ pub async fn get_resource(
             .delimiter(resource_config.parser.field_separator as u8)
             .from_reader(in_bytes.as_ref());
         let mut csv_output_bytes = Vec::<u8>::new();
-        let mut csv_w = csv::Writer::from_writer(&mut csv_output_bytes);
+        let mut csv_w = csv::WriterBuilder::new()
+            .delimiter(
+                opts.delimiter
+                    .try_into()
+                    .context(InvalidOutputDelimiterSnafu)?,
+            )
+            .from_writer(&mut csv_output_bytes);
         let mut in_record = ByteRecord::new();
         while csv_r
             .read_byte_record(&mut in_record)

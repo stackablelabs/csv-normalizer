@@ -1,3 +1,6 @@
+tls:
+  cert: cert.pem
+  privateKey: key.pem
 resources:
   foo:
     backend: http://localhost:9997/test.csv
